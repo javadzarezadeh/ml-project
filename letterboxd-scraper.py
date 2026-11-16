@@ -1,3 +1,4 @@
+
 import argparse
 import kagglehub
 import pandas as pd
@@ -13,7 +14,7 @@ import threading
 
 
 def remove_accents(text):
-    """"Replaces non-URL-friendly characters in movie titles."""
+    """Replaces non-URL-friendly characters in movie titles."""
     nfkd_form = unicodedata.normalize("NFKD", text)
     return "".join(
         c for c in nfkd_form
@@ -46,14 +47,20 @@ def scrape_movie_reviews(session, title, year, num_reviews=15, max_pages=3, dela
     reviews = []
 
     # Try the movie page with and without year
-    year_and_title = f"{make_URL(title)}-{year}"
     title_only = make_URL(title)
-    
-    candidate_urls = [
-        f"https://letterboxd.com/film/{year_and_title}/reviews/",
+
+    candidate_urls = []
+
+    if pd.notna(year):
+        year_and_title = f"{title_only}-{int(year)}"
+        candidate_urls.append(
+            f"https://letterboxd.com/film/{year_and_title}/reviews/"
+        )
+
+    candidate_urls.append(
         f"https://letterboxd.com/film/{title_only}/reviews/"
-    ]
-    
+    )
+
     base_review_url = None
 
     for url in candidate_urls:
@@ -78,7 +85,7 @@ def scrape_movie_reviews(session, title, year, num_reviews=15, max_pages=3, dela
     for page in range(2, max_pages + 1):
         if len(reviews) >= num_reviews:
             break
-            
+
         url = f"{base_review_url}page/{page}/"
         try:
             # Try to reach the review page
@@ -90,11 +97,11 @@ def scrape_movie_reviews(session, title, year, num_reviews=15, max_pages=3, dela
             soup = BeautifulSoup(response.text, "html.parser")
             page_reviews = extract_reviews(soup)
             if not page_reviews:
-                break            
+                break
 
             reviews.extend(page_reviews)
             time.sleep(delay)
-            
+
         except requests.exceptions.RequestException:
             break
 
@@ -118,12 +125,25 @@ def process_single_movie(index, title, year, num_reviews, max_pages, delay):
     return index, title, reviews
 
 
-def main(output, num_reviews=15, max_pages=3, delay=2, checkpoint=25, workers=5):
+def main(output, num_reviews=15, max_pages=3, delay=2, checkpoint=25, workers=30):
+
+    # Track total execution time
+    start_time = time.perf_counter()
 
     # Load the movies dataset
     print("Loading movie dataset...")
-    path = kagglehub.dataset_download("aditya126/movies-box-office-dataset-2000-2024")
-    movies_dataset = pd.read_csv(path + "/enhanced_box_office_data(2000-2024)u.csv")
+    path = kagglehub.dataset_download("rounakbanik/the-movies-dataset")
+    movies_dataset = pd.read_csv(
+        path + "/movies_metadata.csv",
+        low_memory=False
+    )
+
+    # Extract release year from release date
+    movies_dataset["release_date"] = pd.to_datetime(
+        movies_dataset["release_date"],
+        errors="coerce"
+    )
+    movies_dataset["Year"] = movies_dataset["release_date"].dt.year
 
     # Initialize reviews array for every movie
     results = [[] for _ in range(len(movies_dataset))]
@@ -134,19 +154,25 @@ def main(output, num_reviews=15, max_pages=3, delay=2, checkpoint=25, workers=5)
     completed_count = 0
 
     print(f"Starting concurrent scrape with {workers} workers...")
-    
+
     lock = threading.Lock()
 
     def task_wrapper(i, row):
         nonlocal total_reviews, completed_count
-        title = row["Release Group"]
+        title = row["title"]
         year = row["Year"]
 
-        # User worker to scrape reviews
-        idx, title_res, reviews = process_single_movie(
-            i, title, year, num_reviews, max_pages, delay
-        )
-        
+        # Skip movies without a title
+        if pd.isna(title) or not str(title).strip():
+            reviews = []
+            title_res = "Unknown title"
+            idx = i
+        else:
+            # User worker to scrape a single movie
+            idx, title_res, reviews = process_single_movie(
+                i, title, year, num_reviews, max_pages, delay
+            )
+
         with lock:
             completed_count += 1
             results[idx] = reviews
@@ -167,7 +193,16 @@ def main(output, num_reviews=15, max_pages=3, delay=2, checkpoint=25, workers=5)
                 movies_dataset.to_pickle(
                     output.replace(".csv", ".pkl")
                 )
-                print("\nCheckpoint saved.")
+
+                elapsed_time = time.perf_counter() - start_time
+                hours, remainder = divmod(int(elapsed_time), 3600)
+                minutes, seconds = divmod(remainder, 60)
+
+                print(
+                    f"\nCheckpoint saved at {completed_count}/{len(movies_dataset)} movies."
+                    f"\nElapsed time: {hours:02d}:{minutes:02d}:{seconds:02d}"
+                    f"\nTotal reviews: {total_reviews}\n"
+                )
 
         return reviews
 
@@ -184,8 +219,15 @@ def main(output, num_reviews=15, max_pages=3, delay=2, checkpoint=25, workers=5)
     movies_dataset["Reviews"] = results
     movies_dataset.to_csv(output, index=False)
     movies_dataset.to_pickle(output.replace(".csv", ".pkl"))
+
+    elapsed_time = time.perf_counter() - start_time
+    hours, remainder = divmod(int(elapsed_time), 3600)
+    minutes, seconds = divmod(remainder, 60)
+
     print(f"\nSaved to {output}")
     print(f"Movies without reviews: {len(missed_movies)}")
+    print(f"Total reviews collected: {total_reviews}")
+    print(f"Total elapsed time: {hours:02d}:{minutes:02d}:{seconds:02d}")
 
 
 if __name__ == "__main__":
@@ -196,8 +238,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--num_reviews", type=int, default=15)
 
-    parser.add_argument("--max_pages",type=int,default=3)
-
+    parser.add_argument("--max_pages", type=int, default=3)
 
     args = parser.parse_args()
 
