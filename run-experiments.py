@@ -39,7 +39,8 @@ DATASETS = [
     "reviews-expanded.csv",
     "reviews-sentiments-expanded.csv",
     "reviews-emotions-expanded.csv",
-    "reviews-sentiments-and-emotions-expanded.csv"
+    "reviews-sentiments-and-emotions-expanded.csv",
+    "reviews-aspect-sentiments-expanded.csv"
 ]
 
 TARGETS = ["Domestic", "Foreign", "Worldwide"]
@@ -96,6 +97,15 @@ def create_directories(plots_dir):
 def process_dataset(dataset_path):
     print(f"\nProcessing dataset: {dataset_path.name}")
     return pd.read_csv(dataset_path)
+
+
+def check_aspect_sentiment_dataset(raw_dir):
+    output_path = raw_dir / "reviews-aspect-sentiments-expanded.csv"
+
+    if output_path.exists():
+        print(f"\nUsing existing aspect sentiment dataset: {output_path.name}")
+    else:
+        print(f"WARNING: Missing aspect sentiment dataset {output_path}")
 
 
 # ============================================================
@@ -502,6 +512,8 @@ def main(raw_dir, plots_dir):
     if not plots_dir.is_absolute():
         plots_dir = PROJECT_DIR / plots_dir
     processed_dir = PROJECT_DIR / "processed_data"
+
+    check_aspect_sentiment_dataset(raw_dir)
 
     # Clear previous experiment outputs
     for directory in [processed_dir, plots_dir]:

@@ -45,7 +45,11 @@ def validate_annotation_alignment(dataset):
     if "Reviews" not in dataset.columns:
         return
 
-    for column in ["review_sentiments", "review_emotions"]:
+    for column in [
+        "review_sentiments",
+        "review_emotions",
+        "review_aspect_sentiments"
+    ]:
         if column not in dataset.columns:
             continue
 
@@ -87,6 +91,46 @@ def annotation_labels(values):
     return sorted(labels)
 
 
+def aspect_annotation_labels(values):
+    labels = set()
+
+    for annotations in values:
+        for annotation_group in parse_annotations(annotations):
+            annotation_values = (
+                annotation_group
+                if isinstance(annotation_group, list)
+                else [annotation_group]
+            )
+            for annotation in annotation_values:
+                if not isinstance(annotation, dict):
+                    continue
+
+                aspect = clean_category(annotation.get('aspect'))
+                label = clean_category(annotation.get('label'))
+                score = annotation.get('score')
+
+                if score is None:
+                    continue
+                try:
+                    float(score)
+                except (ValueError, TypeError):
+                    continue
+
+                labels.add(f"{aspect}_{label}")
+
+    return sorted(labels)
+
+
+def flatten_aspect_annotations(annotations):
+    flattened = []
+    for annotation_group in parse_annotations(annotations):
+        if isinstance(annotation_group, list):
+            flattened.extend(annotation_group)
+        else:
+            flattened.append(annotation_group)
+    return flattened
+
+
 def transform_emotions(emotions, labels=None):
     emotions = parse_annotations(emotions)
 
@@ -115,6 +159,50 @@ def transform_emotions(emotions, labels=None):
             scores[label].append(score)
 
     features = {"Analyzed_Review_Count": float(analyzed_count)}
+
+    for label, values in scores.items():
+        count = len(values)
+        features[f"{label}_Mean"] = (
+            float(np.mean(values)) if count else 0.0
+        )
+        features[f"{label}_Max"] = float(max(values)) if count else 0.0
+        features[f"{label}_Fraction"] = (
+            count / analyzed_count if analyzed_count else 0
+        )
+
+    return features
+
+
+def transform_aspect_sentiments(annotations, labels=None):
+    annotations = flatten_aspect_annotations(annotations)
+
+    if labels is None:
+        labels = aspect_annotation_labels([annotations])
+
+    scores = {label: [] for label in labels}
+    analyzed_count = 0
+
+    for annotation in annotations:
+        if not isinstance(annotation, dict):
+            continue
+
+        aspect = clean_category(annotation.get('aspect'))
+        label = clean_category(annotation.get('label'))
+        score = annotation.get('score')
+        if score is None:
+            continue
+
+        try:
+            score = float(score)
+        except (ValueError, TypeError):
+            continue
+
+        analyzed_count += 1
+        annotation_label = f"{aspect}_{label}"
+        if annotation_label in scores:
+            scores[annotation_label].append(score)
+
+    features = {"Analyzed_Aspect_Sentiment_Count": float(analyzed_count)}
 
     for label, values in scores.items():
         count = len(values)
@@ -256,6 +344,25 @@ def process_dataframe(
 
         movies_dataset_x = pd.concat([
             movies_dataset_x.drop(columns=[column]),
+            features
+        ], axis=1)
+
+    if 'review_aspect_sentiments' in movies_dataset_x.columns:
+        aspect_labels = aspect_annotation_labels(
+            movies_dataset_x['review_aspect_sentiments']
+        )
+        features = (
+            movies_dataset_x['review_aspect_sentiments']
+            .apply(transform_aspect_sentiments, labels=aspect_labels)
+            .apply(pd.Series)
+            .fillna(0)
+        )
+        features.columns = [
+            make_feature_name("Review_Aspect_Sentiment", name)
+            for name in features.columns
+        ]
+        movies_dataset_x = pd.concat([
+            movies_dataset_x.drop(columns=['review_aspect_sentiments']),
             features
         ], axis=1)
 
