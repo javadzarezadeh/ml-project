@@ -1,7 +1,7 @@
 
 import argparse
-import subprocess
-import sys
+import importlib.util
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +17,18 @@ from sklearn.metrics import (
     mean_squared_error,
     mean_absolute_error
 )
+
+DATA_PROCESSOR_PATH = Path(__file__).with_name("data-processor.py")
+PROJECT_DIR = DATA_PROCESSOR_PATH.parent
+DATA_PROCESSOR_SPEC = importlib.util.spec_from_file_location(
+    "data_processor",
+    DATA_PROCESSOR_PATH
+)
+if DATA_PROCESSOR_SPEC is None or DATA_PROCESSOR_SPEC.loader is None:
+    raise ImportError("Unable to load data-processor.py")
+
+data_processor = importlib.util.module_from_spec(DATA_PROCESSOR_SPEC)
+DATA_PROCESSOR_SPEC.loader.exec_module(data_processor)
 
 
 # ============================================================
@@ -67,7 +79,8 @@ def create_directories(plots_dir):
         "actual_vs_predicted": plots_dir / "actual_vs_predicted",
         "performance": plots_dir / "performance",
         "feature_importance": plots_dir / "feature_importance",
-        "learning_curves": plots_dir / "learning_curves"
+        "learning_curves": plots_dir / "learning_curves",
+        "models": plots_dir / "models"
     }
 
     for directory in directories.values():
@@ -80,53 +93,59 @@ def create_directories(plots_dir):
 # DATA PREPROCESSING
 # ============================================================
 
-def process_dataset(dataset_path, processed_dir):
-
-    dataset_name = dataset_path.stem
-
-    features_path = processed_dir / f"{dataset_name}_X.pkl"
-    targets_path = processed_dir / f"{dataset_name}_Y.pkl"
-
+def process_dataset(dataset_path):
     print(f"\nProcessing dataset: {dataset_path.name}")
-
-    subprocess.run(
-        [
-            sys.executable,
-            "data-processor.py",
-            "--input", str(dataset_path),
-            "--output_x", str(features_path),
-            "--output_y", str(targets_path)
-        ],
-        check=True
-    )
-
-    X = pd.read_pickle(features_path)
-    Y = pd.read_pickle(targets_path)
-
-    return X, Y
+    return pd.read_csv(dataset_path)
 
 
 # ============================================================
 # MODEL TRAINING AND EVALUATION
 # ============================================================
 
-def train_and_evaluate(X, Y, target):
+def train_and_evaluate(dataset, target, processed_dir, dataset_name):
 
-    # Split into training and testing sets
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        Y,
+    # Split raw rows before fitting any preprocessing schema.
+    train_dataset, test_dataset = train_test_split(
+        dataset,
         test_size=TEST_SIZE,
         random_state=RANDOM_STATE
     )
 
-    # Split training data into fitting and validation sets
-    X_fit, X_val, y_fit, y_val = train_test_split(
-        X_train,
-        y_train,
+    fit_dataset, validation_dataset = train_test_split(
+        train_dataset,
         test_size=VALIDATION_SIZE,
         random_state=RANDOM_STATE
     )
+
+    X_fit, y_fit, emotion_labels, sentiment_labels, category_schema = (
+        data_processor.process_dataframe(fit_dataset)
+    )
+    X_val, y_val, _, _, _ = data_processor.process_dataframe(
+        validation_dataset,
+        emotion_labels,
+        sentiment_labels,
+        category_schema
+    )
+    X_test, y_test, _, _, _ = data_processor.process_dataframe(
+        test_dataset,
+        emotion_labels,
+        sentiment_labels,
+        category_schema
+    )
+
+    X_val = X_val.reindex(columns=X_fit.columns, fill_value=0)
+    X_test = X_test.reindex(columns=X_fit.columns, fill_value=0)
+
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    X_fit.to_pickle(processed_dir / f"{dataset_name}_{target}_fit_X.pkl")
+    y_fit.to_pickle(processed_dir / f"{dataset_name}_{target}_fit_Y.pkl")
+    X_val.to_pickle(processed_dir / f"{dataset_name}_{target}_validation_X.pkl")
+    y_val.to_pickle(processed_dir / f"{dataset_name}_{target}_validation_Y.pkl")
+    X_test.to_pickle(processed_dir / f"{dataset_name}_{target}_test_X.pkl")
+    y_test.to_pickle(processed_dir / f"{dataset_name}_{target}_test_Y.pkl")
+
+    fit_target = np.log1p(y_fit[target].to_numpy())
+    validation_target = np.log1p(y_val[target].to_numpy())
 
     model = lgb.LGBMRegressor(**MODEL_PARAMS)
 
@@ -134,11 +153,11 @@ def train_and_evaluate(X, Y, target):
 
     model.fit(
         X_fit,
-        y_fit[target],
+        fit_target,
 
         eval_set=[
-            (X_fit, y_fit[target]),
-            (X_val, y_val[target])
+            (X_fit, fit_target),
+            (X_val, validation_target)
         ],
 
         eval_names=["training", "validation"],
@@ -153,24 +172,29 @@ def train_and_evaluate(X, Y, target):
     )
 
     # Predict test set
-    predictions = model.predict(X_test)
-
-    actual = y_test[target].to_numpy()
-
-    # Calculate metrics
-    r2 = r2_score(actual, predictions)
-
-    rmse = np.sqrt(
-        mean_squared_error(actual, predictions)
+    log_predictions = np.asarray(
+        model.predict(X_test),
+        dtype=float
     )
 
+    actual = y_test[target].to_numpy()
+    log_actual = np.log1p(actual)
+    predictions = np.maximum(np.expm1(log_predictions), 0)
+
+    # Calculate metrics on both the training scale and the revenue scale.
+    r2 = r2_score(actual, predictions)
+    rmse = np.sqrt(mean_squared_error(actual, predictions))
     mae = mean_absolute_error(actual, predictions)
+    log_r2 = r2_score(log_actual, log_predictions)
+    log_rmse = np.sqrt(mean_squared_error(log_actual, log_predictions))
+    log_mae = mean_absolute_error(log_actual, log_predictions)
 
     print(
         f"{target}: "
         f"R2={r2:.4f} | "
         f"RMSE={rmse:.2f} | "
         f"MAE={mae:.2f} | "
+        f"Log RMSE={log_rmse:.4f} | "
         f"Best iteration={model.best_iteration_}"
     )
 
@@ -178,11 +202,19 @@ def train_and_evaluate(X, Y, target):
         "r2": r2,
         "rmse": rmse,
         "mae": mae,
+        "log_r2": log_r2,
+        "log_rmse": log_rmse,
+        "log_mae": log_mae,
         "actual": actual,
         "predictions": predictions,
+        "log_predictions": log_predictions,
+        "log_actual": log_actual,
         "model": model,
         "evals_result": model.evals_result_,
-        "feature_names": model.booster_.feature_name()
+        "feature_names": model.booster_.feature_name(),
+        "emotion_labels": emotion_labels,
+        "sentiment_labels": sentiment_labels,
+        "category_schema": category_schema
     }
 
     return results
@@ -465,7 +497,11 @@ def main(raw_dir, plots_dir):
 
     raw_dir = Path(raw_dir)
     plots_dir = Path(plots_dir)
-    processed_dir = Path("processed_data")
+    if not raw_dir.is_absolute():
+        raw_dir = PROJECT_DIR / raw_dir
+    if not plots_dir.is_absolute():
+        plots_dir = PROJECT_DIR / plots_dir
+    processed_dir = PROJECT_DIR / "processed_data"
 
     # Clear previous experiment outputs
     for directory in [processed_dir, plots_dir]:
@@ -491,10 +527,9 @@ def main(raw_dir, plots_dir):
         print(f"RUNNING EXPERIMENTS: {filename}")
         print("=" * 65)
 
-        # Preprocess dataset
-        X, Y = process_dataset(
-            dataset_path,
-            processed_dir
+        # Load raw rows before splitting and fitting preprocessing.
+        dataset = process_dataset(
+            dataset_path
         )
 
         dataset_results = {}
@@ -505,12 +540,44 @@ def main(raw_dir, plots_dir):
             print(f"\n--- Target: {target} ---")
 
             results = train_and_evaluate(
-                X,
-                Y,
-                target
+                dataset,
+                target,
+                processed_dir,
+                dataset_name
             )
 
             dataset_results[target] = results
+
+            model_artifact = {
+                "model": results["model"],
+                "target": target,
+                "configuration": dataset_name,
+                "feature_names": results["feature_names"],
+                "actual": results["actual"],
+                "predictions": results["predictions"],
+                "log_actual": results["log_actual"],
+                "log_predictions": results["log_predictions"],
+                "metrics": {
+                    "r2": results["r2"],
+                    "rmse": results["rmse"],
+                    "mae": results["mae"],
+                    "log_r2": results["log_r2"],
+                    "log_rmse": results["log_rmse"],
+                    "log_mae": results["log_mae"]
+                },
+                "target_transform": "log1p",
+                "emotion_labels": results["emotion_labels"],
+                "sentiment_labels": results["sentiment_labels"],
+                "category_schema": results["category_schema"]
+            }
+            with open(
+                directories["models"] / f"{dataset_name}_{target}.pkl",
+                "wb"
+            ) as artifact_file:
+                pickle.dump(
+                    model_artifact,
+                    artifact_file
+                )
 
             all_metrics.append({
                 "Dataset": dataset_name,
@@ -580,13 +647,13 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--raw_dir",
-        default="raw-data",
+        default=str(PROJECT_DIR / "raw-data"),
         help="Directory containing raw CSV datasets."
     )
 
     parser.add_argument(
         "--plots_dir",
-        default="plots",
+        default=str(PROJECT_DIR / "plots"),
         help="Directory for saving all plots and results."
     )
 
